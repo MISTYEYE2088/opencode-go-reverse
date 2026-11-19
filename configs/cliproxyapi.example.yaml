@@ -1,0 +1,43 @@
+# CLIProxyAPI v8 with the go-adapter plugin.
+# Copy to config.yaml next to the binary, adjust the paths and keys, start it.
+# Relative paths are resolved from the working directory of the process.
+
+config-version: 8
+
+server:
+  host: "127.0.0.1"   # loopback only: this serves a personal subscription
+  port: 8788
+
+management:
+  allow-remote: false
+  # REQUIRED for the panel, the plugin page and the status/refresh routes: the
+  # host serves no management route at all while this is empty. Change it, and
+  # use the same value as MGMT_KEY when you run scripts/smoke.sh.
+  secret-key: "change-me-management-key"
+
+# Client credentials. These are what YOUR clients send as
+# "Authorization: Bearer <key>"; they are not the OpenCode Go keys.
+access:
+  api-keys:
+    - "local-dev-key"
+
+# One JSON file per OpenCode Go key is written here (mode 0600) when a key is
+# added through the panel. Nothing secret goes into config.yaml.
+oauth:
+  auth-dir: "auth"
+
+routing:
+  # Host-provided: a conversation sticks to one key until it fails, which keeps
+  # upstream prompt caching warm. The plugin adds quota-aware picking on top.
+  session-affinity: true
+  session-affinity-ttl: "24h"
+
+plugins:
+  enabled: true
+  dir: "plugins"      # binaries live in plugins/<goos>/<goarch>/, e.g. plugins/linux/amd64/
+  configs:
+    go-adapter:
+      enabled: true
+      base-url: "https://opencode.ai/inference/go/openai/v1"
+      user-agent: "go-adapter/0.9.4"
+      # models: []       # optional: pin the advertised list instead of the built-in catalogue

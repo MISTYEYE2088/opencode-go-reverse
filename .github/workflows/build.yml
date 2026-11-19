@@ -1,0 +1,164 @@
+name: build
+
+# Builds the plugin as a shared library for every platform the host can load:
+#   linux/amd64   -> go-adapter-v<version>.so
+#   windows/amd64 -> go-adapter-v<version>.dll
+# Plugins are C shared libraries, so cgo must stay enabled and each target needs
+# its own C toolchain: gcc (preinstalled on the Linux runner) and mingw-w64
+# (installed below on the Windows runner). macOS is not built here; the same
+# `go build -buildmode=c-shared` line on a Mac produces the .dylib.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: plugin/go.mod
+          cache-dependency-path: plugin/go.sum
+      - name: go vet
+        working-directory: plugin
+        run: go vet ./...
+      - name: go test -race
+        working-directory: plugin
+        run: go test -race -count=1 ./...
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: plugin/go.mod
+          cache-dependency-path: plugin/go.sum
+
+      # cgo on Windows needs a C compiler; the runner has none.
+      - name: Install mingw-w64
+        if: matrix.goos == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Check the tag matches VERSION
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < plugin/VERSION)
+          if [[ "${GITHUB_REF}" == refs/tags/* && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
+            exit 1
+          fi
+
+      # Linux: build inside manylinux2014 (glibc 2.17) so the library loads on
+      # RHEL 7/8, Ubuntu 20.04 and Debian 11 too, not only on newest distros.
+      - name: Build shared library (linux, glibc 2.17 baseline)
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < plugin/VERSION)
+          GO_VERSION=$(go env GOVERSION | sed 's/^go//') scripts/build-linux-container.sh "$PWD/dist"
+          artifact="go-adapter-v${version}.so"
+          cd dist
+          rm -f go-adapter-v*.h
+          sha256sum "${artifact}" > "${artifact}.sha256"
+          cat "${artifact}.sha256"
+
+      - name: Build shared library (windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        working-directory: plugin
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          export PATH="/c/msys64/ucrt64/bin:${PATH}"
+          export CC=gcc
+          export CGO_ENABLED=1
+          artifact="go-adapter-v${version}.dll"
+          mkdir -p ../dist
+          go build -trimpath -buildvcs=false -buildmode=c-shared \
+            -ldflags "-s -w -X main.pluginVersion=${version}" \
+            -o "../dist/${artifact}" .
+          cd ../dist
+          sha256sum "${artifact}" > "${artifact}.sha256"
+          cat "${artifact}.sha256"
+          rm -f go-adapter-v*.h
+
+      - name: Stage into the host's plugin layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < plugin/VERSION)
+          ext=so
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then ext=dll; fi
+          mkdir -p "staged/plugins/${{ matrix.goos }}/${{ matrix.goarch }}"
+          cp "dist/go-adapter-v${version}.${ext}" "staged/plugins/${{ matrix.goos }}/${{ matrix.goarch }}/"
+          cp dist/*.sha256 staged/
+          find staged -type f
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-adapter-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: staged/
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The staged artifacts keep the host's plugins/<os>/<arch>/ layout, so the
+          # assets are collected by file: gh refuses a directory argument.
+          mapfile -t assets < <(find dist -type f | sort)
+          printf '%s\n' "${assets[@]}"
+          [ "${#assets[@]}" -gt 0 ] || { echo "no assets found" >&2; exit 1; }
+          if gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber -R "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" -R "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Copy the file for your platform into <CLIProxyAPI>/plugins/<os>/<arch>/ (for example plugins/windows/amd64/), then enable it in config.yaml."
+          fi
