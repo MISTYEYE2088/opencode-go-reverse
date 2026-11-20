@@ -237,6 +237,72 @@ served=$(timeout 30 curl -m 25 -sS "$BASE/v1/models" -H "Authorization: Bearer $
   && ok "T15 catalogue served live from upstream ($served models)" \
   || bad "T15 catalogue source" "source=$src listed=$listed served=$served"
 
+# T16 — the panel page ships hardened: CSP pinning the script hash, no data.
+hdrs=$(timeout 20 curl -m 15 -sS -D - -o /dev/null "$BASE/v0/resource/plugins/go-adapter/status")
+echo "$hdrs" | grep -qi "content-security-policy:.*sha256-" \
+  && ok "T16 panel CSP pins the script hash" || bad "T16 panel CSP" "no sha256-pinned CSP header"
+echo "$hdrs" | grep -qi "x-frame-options: DENY" \
+  && ok "T16 panel refuses framing" || bad "T16 panel framing" "no X-Frame-Options: DENY"
+page=$(timeout 20 curl -m 15 -sS "$BASE/v0/resource/plugins/go-adapter/status")
+echo "$page" | grep -q "oc_sk_" \
+  && bad "T16 panel leak" "key prefix found in the public page" \
+  || ok "T16 public page carries no key material"
+echo "$page" | grep -q "innerHtml\|innerHTML" \
+  && bad "T16 panel XSS" "page uses innerHTML" \
+  || ok "T16 page builds DOM without innerHTML"
+
+# T17 — pause parks an account and unpause frees it: the management route
+# round-trips and the status reports the remaining time.
+PAUSE_JSON=$(timeout 20 curl -m 15 -sS -X POST \
+  -H "Authorization: Bearer $MGMT_KEY" -H "Content-Type: application/json" \
+  -d '{"auth_id":"go-adapter-1","minutes":2}' \
+  "$BASE/v0/management/plugins/go-adapter/pause")
+echo "$PAUSE_JSON" | grep -q '"paused":true' \
+  && ok "T17 pause route parks an account" || bad "T17 pause" "$PAUSE_JSON"
+echo "$PAUSE_JSON" | grep -q '"remaining":0' \
+  && bad "T17 pause" "remaining must be nonzero while parked" \
+  || ok "T17 pause reports remaining time"
+UNPAUSE_JSON=$(timeout 20 curl -m 15 -sS -X POST \
+  -H "Authorization: Bearer $MGMT_KEY" -H "Content-Type: application/json" \
+  -d '{"auth_id":"go-adapter-1","minutes":0}' \
+  "$BASE/v0/management/plugins/go-adapter/pause")
+echo "$UNPAUSE_JSON" | grep -q '"paused":false' \
+  && ok "T17 pause route unparks on minutes=0" || bad "T17 unpause" "$UNPAUSE_JSON"
+
+# T18 — the single-key refresh scopes to the named account and an unknown id
+# errors instead of silently refreshing everything.
+ONE=$(timeout 60 curl -m 50 -sS -X POST \
+  -H "Authorization: Bearer $MGMT_KEY" \
+  "$BASE/v0/management/plugins/go-adapter/refresh?auth_id=go-adapter-1")
+echo "$ONE" | grep -q '"checked": 1' \
+  && ok "T18 single-key refresh checks exactly one account" || bad "T18 one refresh" "$ONE"
+code=$(timeout 20 curl -m 15 -sS -o /tmp/smoke_one_err -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $MGMT_KEY" \
+  "$BASE/v0/management/plugins/go-adapter/refresh?auth_id=no-such-account")
+[ "$code" = "500" ] && ok "T18 unknown auth_id is an error" \
+  || bad "T18 unknown auth_id" "http=$code $(head -c 120 /tmp/smoke_one_err)"
+
+# T19 — status carries the P1 surfaces: breakdown, resets countdown, file name,
+# recent decisions; the add form exists on the page.
+STATUS_JSON=$(timeout 20 curl -m 15 -sS -H "Authorization: Bearer $MGMT_KEY" \
+  "$BASE/v0/management/plugins/go-adapter/status")
+echo "$STATUS_JSON" | python3 -c '
+import json,sys,sys
+s=json.load(sys.stdin)
+a=[x for x in s["accounts"] if x["id"]=="go-adapter-1"]
+assert a, "go-adapter-1 missing"
+a=a[0]
+need=[("file_name",a.get("file_name")),("breakdown",a.get("breakdown")),("resets_in",a.get("resets_in"))]
+missing=[k for k,v in need if not v]
+sys.exit(1 if missing else 0)
+' 2>/dev/null \
+  && ok "T19 status carries file_name, breakdown, resets countdown" \
+  || bad "T19 status fields" "missing one of file_name/breakdown/resets_in"
+echo "$STATUS_JSON" | grep -q '"recent_picks"' \
+  && ok "T19 status exposes recent decisions" || bad "T19 recent picks" "no recent_picks array"
+echo "$page" | grep -q "Add a key" \
+  && ok "T19 page offers the add-key form" || bad "T19 add form" "form missing"
+
 echo
 echo "smoke result: PASS=$PASS FAIL=$FAIL SKIP=$SKIP (model=$MODEL)"
 [ "$FAIL" = "0" ]

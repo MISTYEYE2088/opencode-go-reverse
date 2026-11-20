@@ -89,6 +89,7 @@ func probeKey(client *http.Client, apiKey, baseURL string) (string, string) {
 func probeKeyWithQuota(client *http.Client, apiKey, baseURL string) (string, string, Quota) {
 	quota, err := fetchUsageWith(client, apiKey, baseURL)
 	if err != nil {
+		recordErr("", "probe", scrub([]byte(err.Error()), errorContext))
 		var bad invalidKeyError
 		if errors.As(err, &bad) {
 			return statusInvalid, bad.reason, Quota{}

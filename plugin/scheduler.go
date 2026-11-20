@@ -177,10 +177,37 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 
 	decision := Pick(cands, opts)
 	logPick(hash, decision)
+	recordPick(pickRecord{
+		Time: time.Now().UTC().Format(time.RFC3339), Session: hash, Model: req.Model,
+		Foreign: countForeign(cands) > 0, Winner: decision.AuthID, Reason: decision.Reason,
+		Decision: decisionLabel(decision), Scores: decision.Ranked,
+	})
 	if decision.Handled {
 		bindSession(hash, decision.AuthID)
 	}
 	return json.Marshal(pickResponseFor(decision, cands))
+}
+
+// countForeign reports how many candidates belong to another provider.
+func countForeign(cands []candidate) int {
+	n := 0
+	for _, c := range cands {
+		if c.Foreign {
+			n++
+		}
+	}
+	return n
+}
+
+// decisionLabel is the one-word outcome the panel shows.
+func decisionLabel(d decision) string {
+	if d.Handled {
+		if strings.Contains(d.Reason, "tie") {
+			return "picked (tie-break)"
+		}
+		return "picked"
+	}
+	return "declined"
 }
 
 // coversGoModels reports whether the host resolved this request to our provider.
@@ -303,6 +330,12 @@ func buildCandidates(scheds []schedCandidate, bound string, resolve func(string)
 				Foreign:     true,
 				SameSession: bound != "" && bound == c.ID,
 			})
+			continue
+		}
+		if isPaused(c.ID) {
+			// Operator-parked account: excluded from ranking entirely, the
+			// same way a disabled one is, but for a bounded time only.
+			cands = append(cands, candidate{AuthID: c.ID, Suspect: "paused by operator"})
 			continue
 		}
 		key, keyOK := resolve(c.ID)

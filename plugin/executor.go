@@ -408,7 +408,10 @@ func handleExecute(raw []byte) ([]byte, error) {
 		return nil, transportError(errDo)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, upstreamError(resp.StatusCode, readErrorBody(resp), retryAfterOf(resp.Header))
+		errBody := readErrorBody(resp)
+		recordErr(req.AuthID, "upstream",
+			fmt.Sprintf("http %d: %s", resp.StatusCode, scrub(errBody, errorContext)))
+		return nil, upstreamError(resp.StatusCode, errBody, retryAfterOf(resp.Header))
 	}
 	defer resp.Body.Close()
 	body, errRead := io.ReadAll(io.LimitReader(resp.Body, responseCap+1))
@@ -452,7 +455,10 @@ func handleExecuteStream(raw []byte) ([]byte, error) {
 		return nil, transportError(errDo)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, upstreamError(resp.StatusCode, readErrorBody(resp), retryAfterOf(resp.Header))
+		errBody := readErrorBody(resp)
+		recordErr(req.AuthID, "upstream",
+			fmt.Sprintf("http %d: %s", resp.StatusCode, scrub(errBody, errorContext)))
+		return nil, upstreamError(resp.StatusCode, errBody, retryAfterOf(resp.Header))
 	}
 	if req.StreamID != "" {
 		go pumpStream(req.StreamID, resp)
