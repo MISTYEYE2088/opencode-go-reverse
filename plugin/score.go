@@ -67,6 +67,15 @@ type Window struct {
 }
 
 // Exhausted reports whether this window has nothing left.
+// #FUNC      Report whether this window has no quota left.
+// #EDGE-IN   `rate-limited` with percent under 100 → exhausted anyway: the
+//
+//	gateway's status word outranks its counter → TestVetoRules
+//
+// #EDGE-IN   an unreadable window → never exhausted: no data is not zero
+// #WHY       `Exhausted` is the veto source; a silent false would route traffic
+//
+//	onto a throttled account, a silent true would sideline a good one.
 func (w Window) Exhausted() bool {
 	if !w.Known {
 		return false
@@ -75,6 +84,11 @@ func (w Window) Exhausted() bool {
 }
 
 // Remaining is the complement of Percent, clamped to 0..100.
+//
+// #FUNC      The percent of a window still available.
+// #WHY       clamped `math.Min(100, ...)` because the gateway has been seen to
+//
+//	report percent above 100 on a hard-throttled key.
 func (w Window) Remaining() float64 {
 	if !w.Known {
 		return 0
@@ -105,6 +119,10 @@ type scoreOptions struct {
 	// apply; the windows still feed the score, and the -20000 dead-key
 	// quarantine is model-independent.
 	FreeModel bool
+	// TieSeed makes an equal-score decision deterministic. It is the session
+	// hash, so one conversation always lands on one account while different
+	// conversations spread across the pool.
+	TieSeed string
 }
 
 func defaultScoreOptions(now time.Time) scoreOptions {
@@ -118,6 +136,23 @@ func defaultScoreOptions(now time.Time) scoreOptions {
 
 // monthlyDensity returns 0..1: monthly spending room left per unit of remaining
 // time, relative to an even-spend pace.
+//
+// #FUNC      Score the monthly window by burn pace, not raw percentage.
+// #IN        20% left, reset in 2 days of a 30-day window → full density.
+// #EDGE-IN   no `resetsAt` → raw remaining/100 → TestNoResetTimeFallsBackToRawRemaining
+// #EDGE-IN   reset far in the past → raw remaining: an implausible clock must
+//
+//	not grant full density → TestMonthlyDensityIgnoresAncientResetsAt
+//
+// #EDGE-IN   reset overdue within the hour → density 1: the quota is about to
+//
+//	renew, spend it → TestResettingNowIsTreatedAsFullDensity
+//
+// #OUT       `pace/cap` with time fraction floored at `minTimeFraction`.
+// #WHY       `pace` compares a budget against its own clock: 15% left with 3
+//
+//	days to reset can absorb more traffic now than 50% left with 20
+//	days, and use-it-or-lose-it quota must be spent before it expires.
 func monthlyDensity(w Window, opts scoreOptions) float64 {
 	if !w.Known {
 		return neutralFraction
@@ -159,6 +194,24 @@ func monthlyDensity(w Window, opts scoreOptions) float64 {
 
 // Score returns the integer score for one candidate and the veto reason (empty
 // when not vetoed).
+//
+// #FUNC      One candidate's rank: 700·rolling + 200·monthly density + 1000
+//
+//	same-session, veto at -10000, quarantined keys at -20000.
+//
+// #EDGE-IN   an unreadable window → the neutral half-share (450 of 900), never
+//
+//	zero: no data must not starve an account → TestUnknownQuotaIsNeutral
+//
+// #EDGE-IN   `opts.FreeModel` (a "-free" model) → vetoes are skipped: free tier
+//
+//	draws no paid quota and must stay reachable → TestFreeModelSkipsWindowVetoes
+//
+// #OUT       the integer score and the veto reason string.
+// #WHY       `rollingWeight`=700 dominates because the 5-hour window is the
+//
+//	binding constraint at request time; monthly is density-scored
+//	because raw percentage ignores when the budget expires.
 func Score(q Quota, sameSession bool, opts scoreOptions) (int, string) {
 	if opts.Now.IsZero() {
 		opts = defaultScoreOptions(time.Now())

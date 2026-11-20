@@ -22,18 +22,23 @@ func TestPickDeclinesOnGarbagePayload(t *testing.T) {
 	}
 }
 
-// sched-1-2: a decline still excludes the credentials the plugin proved dead.
-func TestDeclineExcludesVetoedCandidates(t *testing.T) {
+// sched-1-2: a healthy winner is named outright, and the dead credential is
+// still reported so the host never rotates onto it.
+func TestPickNamesWinnerAndListsDead(t *testing.T) {
 	d := Pick([]candidate{
 		{AuthID: "a", Quota: acct(40, 40, 20*24*time.Hour)},
 		{AuthID: "b", Quota: acct(40, 40, 20*24*time.Hour)},
-		{AuthID: "dead", VetoReason: "invalid-key: unauthorized", Quota: acct(40, 40, 20*24*time.Hour)},
-	}, defaultScoreOptions(now))
-	if d.Handled {
-		t.Fatal("two identical healthy candidates must tie into a decline")
+		// An exhausted window is the production veto path: Score returns it,
+		// no out-of-band flag involved.
+		{AuthID: "dead", Quota: acct(40, 100, 20*24*time.Hour)},
+	}, opts())
+	if !d.Handled || (d.AuthID != "a" && d.AuthID != "b") {
+		t.Fatalf("a healthy candidate must win, got %+v", d)
 	}
-	if len(d.Vetoed) != 1 || d.Vetoed[0] != "dead" {
-		t.Fatalf("decline must exclude the vetoed id, got %v", d.Vetoed)
+	// Vetoed is the decline-time hint; a handled decision names its winner
+	// instead, so it stays empty by design.
+	if len(d.Vetoed) != 0 {
+		t.Fatalf("handled decision must not carry exclusions, got %v", d.Vetoed)
 	}
 }
 
@@ -41,7 +46,7 @@ func TestDeclineExcludesVetoedCandidates(t *testing.T) {
 func TestPickRankedShowsVetoOverride(t *testing.T) {
 	d := Pick([]candidate{
 		{AuthID: "healthy", Quota: acct(10, 10, 20*24*time.Hour)},
-		{AuthID: "dead", VetoReason: "invalid-key: unauthorized", SameSession: true, Quota: acct(10, 10, 20*24*time.Hour)},
+		{AuthID: "dead", SameSession: true, Quota: acct(10, 100, 20*24*time.Hour)},
 	}, defaultScoreOptions(now))
 	if !d.Handled || d.AuthID != "healthy" {
 		t.Fatalf("vetoed sticky must lose: %+v", d)
@@ -108,11 +113,64 @@ func TestPickPrefersStickySession(t *testing.T) {
 	}
 }
 
-func TestPickDeclinesOnTie(t *testing.T) {
+// A tie is a decision: the session seed names the winner, so one conversation
+// keeps one account instead of alternating between equal-scoring keys.
+func TestPickBreaksTieFromSessionSeed(t *testing.T) {
 	q := acct(40, 40, 20*24*time.Hour)
-	d := Pick([]candidate{{AuthID: "a", Quota: q}, {AuthID: "b", Quota: q}}, opts())
-	if d.Handled {
-		t.Fatalf("tie must defer, got %+v", d)
+	tied := []candidate{{AuthID: "a", Quota: q}, {AuthID: "b", Quota: q}}
+
+	first := opts()
+	first.TieSeed = "session-hash-1"
+	d := Pick(tied, first)
+	if !d.Handled {
+		t.Fatalf("a tie must be decided, got %+v", d)
+	}
+	if !strings.Contains(d.Reason, "tie") {
+		t.Fatalf("reason must say the tie was broken, got %q", d.Reason)
+	}
+	// Deterministic: the same session always lands on the same account.
+	for i := 0; i < 5; i++ {
+		again := opts()
+		again.TieSeed = "session-hash-1"
+		if got := Pick(tied, again); got.AuthID != d.AuthID {
+			t.Fatalf("same seed must pick the same account: %q then %q", d.AuthID, got.AuthID)
+		}
+	}
+}
+
+// Different conversations must spread across the pool, not collapse onto one
+// account: stickiness is per session, not a permanent favourite.
+func TestTieBreakSpreadsSessionsAcrossThePool(t *testing.T) {
+	q := acct(40, 40, 20*24*time.Hour)
+	tied := []candidate{{AuthID: "go-adapter-1", Quota: q}, {AuthID: "go-adapter-2", Quota: q}}
+
+	seen := map[string]int{}
+	for i := 0; i < 200; i++ {
+		o := opts()
+		o.TieSeed = fmt.Sprintf("session-%d", i)
+		d := Pick(tied, o)
+		if !d.Handled {
+			t.Fatalf("session %d must be decided, got %+v", i, d)
+		}
+		seen[d.AuthID]++
+	}
+	if seen["go-adapter-1"] < 60 || seen["go-adapter-2"] < 60 {
+		t.Fatalf("sessions must spread across both accounts, got %v", seen)
+	}
+}
+
+// No session header at all is still not a reason to alternate.
+func TestTieWithoutSessionIsStillDecided(t *testing.T) {
+	q := acct(40, 40, 20*24*time.Hour)
+	tied := []candidate{{AuthID: "a", Quota: q}, {AuthID: "b", Quota: q}}
+	first := Pick(tied, opts())
+	if !first.Handled {
+		t.Fatalf("a tie without a session must still be decided, got %+v", first)
+	}
+	for i := 0; i < 5; i++ {
+		if got := Pick(tied, opts()); got.AuthID != first.AuthID {
+			t.Fatalf("seedless tie must be stable: %q then %q", first.AuthID, got.AuthID)
+		}
 	}
 }
 
@@ -135,8 +193,8 @@ func TestExplicitVetoBeatsSticky(t *testing.T) {
 	// A sticky session whose account's key has died must lose to a healthy one.
 	d := Pick([]candidate{
 		{AuthID: "healthy", Quota: Quota{Rolling: win(50, 2*time.Hour), Weekly: win(1, 24*time.Hour), Monthly: win(30, 20*24*time.Hour)}},
-		{AuthID: "dead", SameSession: true, VetoReason: "invalid-key: unauthorized",
-			Quota: Quota{Rolling: win(10, 2*time.Hour), Weekly: win(1, 24*time.Hour), Monthly: win(30, 20*24*time.Hour)}},
+		{AuthID: "dead", SameSession: true,
+			Quota: Quota{Rolling: win(10, 2*time.Hour), Weekly: win(1, 24*time.Hour), Monthly: win(100, 24*time.Hour)}},
 	}, defaultScoreOptions(now))
 	if !d.Handled || d.AuthID != "healthy" {
 		t.Fatalf("dead sticky account must lose, got %+v", d)
@@ -164,5 +222,48 @@ func TestPickDoesNotBlockOnColdQuotaCache(t *testing.T) {
 	}
 	if len(cands) != 1 || cands[0].Suspect != "" {
 		t.Fatalf("a cold cache must be neutral, not suspicious: %+v", cands)
+	}
+}
+
+// A pool the host offers only for another provider is not ours to schedule:
+// declining keeps the host's own selector in charge of that provider.
+func TestPickDeclinesWhenOnlyForeignCandidates(t *testing.T) {
+	body, errMarshal := json.Marshal(schedPickRequest{
+		Provider:   "deepseek",
+		Providers:  []string{"deepseek"},
+		Model:      "deepseek-chat",
+		Candidates: []schedCandidate{{ID: "deepseek-1", Provider: "deepseek"}},
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	out, err := handleSchedulerPick(body)
+	if err != nil {
+		t.Fatalf("foreign pool must not error: %v", err)
+	}
+	var resp schedPickResponse
+	if errDecode := json.Unmarshal(out, &resp); errDecode != nil {
+		t.Fatalf("decode: %v", errDecode)
+	}
+	if resp.Handled || resp.Reject || len(resp.ExcludeCandidates) != 0 {
+		t.Fatalf("a foreign pool must be left to the host untouched, got %+v", resp)
+	}
+}
+
+// The host runs one scheduler for every provider, so the candidate list can mix
+// owners; only our own credentials may be scored, the rest are marked foreign.
+func TestBuildCandidatesMarksOtherProvidersForeign(t *testing.T) {
+	cands := buildCandidates([]schedCandidate{
+		{ID: "go-adapter-1", Provider: "go-adapter"},
+		{ID: "deepseek-1", Provider: "deepseek"},
+	}, "", keyForAuthID)
+	if len(cands) != 2 {
+		t.Fatalf("want both candidates, got %+v", cands)
+	}
+	if cands[0].Foreign {
+		t.Fatalf("our own credential must not be foreign: %+v", cands[0])
+	}
+	if !cands[1].Foreign {
+		t.Fatalf("another provider's credential must be foreign: %+v", cands[1])
 	}
 }

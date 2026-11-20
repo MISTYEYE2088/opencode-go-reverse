@@ -26,6 +26,14 @@ type pluginConfig struct {
 // plugin's own advertised config field describes the scalar form.
 type stringList []string
 
+// #FUNC      Accept `models:` as a YAML list or a comma-separated scalar.
+// #EDGE-IN   `models: 123` or `[1,2]` → a decode error, never a silent
+//
+//	zero-value list → TestParseConfigRejectsNonStringModels
+//
+// #WHY       a numeric node decoded as an empty list would silently pin the
+//
+//	catalogue to nothing.
 func (s *stringList) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
 		// A scalar must actually be a string: `models: 123` or `models: true` is
@@ -117,6 +125,10 @@ func init() {
 }
 
 // currentConfig returns the live configuration for serving paths.
+// #FUNC      The live config snapshot for serving paths.
+// #WHY       an `atomic.Pointer` because reconfigure and executor calls run on
+//
+//	parallel goroutines — a plain variable would race.
 func currentConfig() pluginConfig {
 	if p := configPtr.Load(); p != nil {
 		return *p

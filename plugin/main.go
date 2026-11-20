@@ -164,6 +164,14 @@ type rpcEnvelopeErr struct {
 }
 
 // callHost performs one host callback and decodes its result into out.
+// #FUNC      One JSON RPC call into the host's C callback.
+// #EDGE-IN   a reply longer than `math.MaxInt32` → refused, not truncated into
+//
+//	a negative length that panics past every recover().
+//
+// #WHY       every host interaction the plugin has goes through here, so the
+//
+//	boundary rules (size caps, freed buffers) exist in exactly one place.
 func callHost(method string, payload any, out any) error {
 	var req []byte
 	if payload != nil {
@@ -234,9 +242,14 @@ type authGetResponse struct {
 	JSON      json.RawMessage `json:"json"`
 }
 
-// keyForAuthID resolves an auth record's API key through the host, so the
-// scheduler can score accounts it never received a secret for.
-func keyForAuthID(authID string) (string, bool) {
+// hostAuthKey asks the host for one auth record's API key: list the records,
+// then fetch the credential behind the matching index. It is the slow path of
+// keyForAuthID and runs only when the cached mapping has aged out.
+// #FUNC      Ask the host for one auth record's key: list, then fetch by index.
+// #WHY       the slow path of `keyForAuthID` only; on the pick path this would
+//
+//	be two host calls per candidate per request.
+func hostAuthKey(authID string) (string, bool) {
 	var list authFileList
 	if err := callHost(pluginabi.MethodHostAuthList, struct{}{}, &list); err != nil {
 		return "", false

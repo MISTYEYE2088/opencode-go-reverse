@@ -182,6 +182,13 @@ type poolStatus struct {
 
 // statusJSON renders the pool: per key the host state, the quarantine flag, and —
 // for keys that are not quarantined — the live windows plus the scheduler score.
+// #FUNC      Render the pool: per key the host state, quarantine, live windows
+//
+//	and the scheduler score.
+//
+// #WHY       every number here must match the pick log exactly — a status page
+//
+//	that disagrees with the scheduler is worse than none.
 func statusJSON() ([]byte, error) {
 	var list authFileList
 	if err := callHost(pluginabi.MethodHostAuthList, struct{}{}, &list); err != nil {
@@ -266,6 +273,13 @@ type refreshSummary struct {
 
 // refreshAllJSON is the manual button for the whole pool: every key gets the same
 // forced probe the per-auth quota button does, and recovered keys rejoin.
+// #FUNC      The manual pool-wide re-probe: every key is checked, quarantined
+//
+//	keys revive on a valid answer, network failures cost nothing.
+//
+// #WHY       this is the documented recovery path for a definitive rejection;
+//
+//	routine checks stay off for quarantined keys by policy.
 func refreshAllJSON() ([]byte, error) {
 	var list authFileList
 	if err := callHost(pluginabi.MethodHostAuthList, struct{}{}, &list); err != nil {

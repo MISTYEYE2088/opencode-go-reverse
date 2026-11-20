@@ -86,8 +86,13 @@ func handleAuthParse(raw []byte) ([]byte, error) {
 	storage, _ := json.Marshal(credential{APIKey: strings.TrimSpace(cred.APIKey), Label: cred.Label})
 
 	apiKey := strings.TrimSpace(cred.APIKey)
-	status, reason := checkKey(apiKey, currentConfig().BaseURL)
+	base := currentConfig().BaseURL
+	status, reason, quota := checkKeyWithQuota(apiKey, base)
 	applyQuarantineFromProbe(apiKey, status, reason)
+	// One validation call already returned the windows and the credential we
+	// would otherwise re-ask the host for on every pick: keep both.
+	seedQuota(apiKey, base, quota)
+	rememberAuthKey(id, apiKey)
 	return json.Marshal(authParseResponse{
 		Handled: true,
 		Auth: &authData{
@@ -194,8 +199,11 @@ func handleAuthRefresh(raw []byte) ([]byte, error) {
 		})
 	}
 
-	status, reason := checkKey(apiKey, currentConfig().BaseURL)
+	base := currentConfig().BaseURL
+	status, reason, quota := checkKeyWithQuota(apiKey, base)
 	applyQuarantineFromProbe(apiKey, status, reason)
+	seedQuota(apiKey, base, quota)
+	rememberAuthKey(req.AuthID, apiKey)
 	state := authStateFn(req.AuthID)
 	return json.Marshal(authRefreshResponse{
 		Auth: authData{
@@ -272,6 +280,10 @@ func labelFor(cred credential) string {
 	return providerKey
 }
 
+// #FUNC      Answer which provider id this plugin claims.
+// #WHY       the host routes auth-file management by provider id, so claiming
+//
+//	`go-adapter` here is what makes the panel's auth dialogs work.
 func handleAuthIdentifier() []byte {
 	raw, _ := json.Marshal(identifierResponse{Identifier: providerKey})
 	return raw

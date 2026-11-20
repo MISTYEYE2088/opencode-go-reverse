@@ -45,8 +45,30 @@ func (e transientUsageError) Error() string { return "usage unavailable: " + e.r
 // checkKey probes the gateway live. There is deliberately no result cache: the
 // only callers are auth parse and auth refresh, both rare, and a cached verdict
 // is exactly how a just-revoked key slips past an add-time check.
+// #FUNC      Probe the gateway's usage route and classify the key.
+// #NOT       No result cache: the callers are parse/refresh, and a cached verdict
+//
+//	is how a revoked key slips past an add-time check.
+//
+// #OUT       `statusValid`, `statusInvalid`, or `statusUnknown` with a reason.
+// #WHY       the usage route answers "alive?" and "how much is left?" in one
+//
+//	call, so validation costs no tokens.
 func checkKey(apiKey, baseURL string) (string, string) {
-	return probeKey(&http.Client{Timeout: keyCheckTimeout}, apiKey, baseURL)
+	status, reason, _ := checkKeyWithQuota(apiKey, baseURL)
+	return status, reason
+}
+
+// checkKeyWithQuota validates a key and hands back the usage it just read.
+//
+// #FUNC     Validate one key and return the windows that came with the answer.
+// #OUT      the verdict, its reason, and the Quota the gateway reported.
+// #WHY      the usage route answers "is this key alive" and "how much is left"
+//
+//	in one call; discarding the windows forced the first scheduler pick
+//	to score the account at the neutral 450.
+func checkKeyWithQuota(apiKey, baseURL string) (string, string, Quota) {
+	return probeKeyWithQuota(&http.Client{Timeout: keyCheckTimeout}, apiKey, baseURL)
 }
 
 // probeKey runs one live probe and classifies it.
@@ -59,18 +81,25 @@ func checkKey(apiKey, baseURL string) (string, string) {
 //
 //	that is having a bad minute; a 502 at 03:00 must not empty the pool.
 func probeKey(client *http.Client, apiKey, baseURL string) (string, string) {
-	if _, err := fetchUsageWith(client, apiKey, baseURL); err != nil {
+	status, reason, _ := probeKeyWithQuota(client, apiKey, baseURL)
+	return status, reason
+}
+
+// probeKeyWithQuota is probeKey plus the quota it already fetched.
+func probeKeyWithQuota(client *http.Client, apiKey, baseURL string) (string, string, Quota) {
+	quota, err := fetchUsageWith(client, apiKey, baseURL)
+	if err != nil {
 		var bad invalidKeyError
 		if errors.As(err, &bad) {
-			return statusInvalid, bad.reason
+			return statusInvalid, bad.reason, Quota{}
 		}
 		var transient transientUsageError
 		if errors.As(err, &transient) {
-			return statusUnknown, transient.reason
+			return statusUnknown, transient.reason, Quota{}
 		}
-		return statusUnknown, "usage-unreachable"
+		return statusUnknown, "usage-unreachable", Quota{}
 	}
-	return statusValid, ""
+	return statusValid, "", quota
 }
 
 // keyMetadata is what the auth record carries so the panel and the logs can say
@@ -104,6 +133,11 @@ func keyMetadata(status, reason string) map[string]any {
 
 // visibleNote is the one-line, human-readable verdict shown in the host panel.
 // Valid keys stay silent; everything a debugger needs is on one line.
+// #FUNC      The one-line verdict the host renders next to the key.
+// #WHY       the host's auth listing shows `note` verbatim, so putting the
+//
+//	quarantine reason there makes it visible without opening the
+//	plugin page.
 func visibleNote(status, reason string) string {
 	switch status {
 	case statusInvalid, "quarantined":
@@ -118,6 +152,11 @@ func visibleNote(status, reason string) string {
 
 // usageURL derives the current usage route from the configured chat base:
 // https://…/inference/go/openai/v1 -> https://…/inference/go/v1/usage
+//
+// #FUNC      Map the chat base to the usage route.
+// #WHY       `/inference/go/v1/usage` mirrors the chat path minus `openai/`,
+//
+//	so the configured `base-url` alone decides the target.
 func usageURL(base string) string {
 	b := strings.TrimSuffix(base, "/")
 	b = strings.TrimSuffix(b, "/openai/v1")
@@ -131,6 +170,13 @@ func usageURL(base string) string {
 // #WHY it is the single fallback when the current route is missing or broken, so
 //
 //	a route rename costs a fallback instead of quarantining every key.
+//
+// #FUNC      Map the chat base to the legacy `/zen/go/v1/usage` route.
+// #EDGE-IN   an unparseable base → "" and no fallback is attempted.
+// #WHY       `/zen/go/v1` is the route pi-ai clients still use; keeping it as the
+//
+//	single fallback turns a route rename into a fallback, not a
+//	fleet-wide quarantine.
 func legacyUsageURL(base string) string {
 	u, err := url.Parse(strings.TrimSpace(base))
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -176,6 +222,24 @@ func fetchUsageWith(client *http.Client, apiKey, base string) (Quota, error) {
 }
 
 // fetchUsageRoute performs one usage request and classifies the answer.
+// #FUNC      One usage request, classified.
+// #EDGE-IN   `401` → `invalidKeyError` (fallback NOT tried: the key is the
+//
+//	problem, not the route) → TestUnauthorizedKeyIsInvalid
+//
+// #EDGE-IN   `403` containing `EntitlementError` → invalid: the key
+//
+//	authenticates but has no Go plan → TestUnauthorizedKeyIsInvalid
+//
+// #EDGE-IN   `200` with a body that is not a three-window usage document →
+//
+//	`transientUsageError`: a WAF page must not validate or quarantine
+//	a key → TestMalformed200IsNotAUsageDocument
+//
+// #OUT       a normalised `Quota`, or the classified error.
+// #WHY       `status ∈ {ok, rate-limited}` and `percent` in 0..100 are the whole
+//
+//	contract; anything else is "no answer", never a partial one.
 func fetchUsageRoute(client *http.Client, route, apiKey string) (Quota, error) {
 	req, errReq := http.NewRequest(http.MethodGet, route, nil)
 	if errReq != nil {

@@ -1,24 +1,30 @@
 package main
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
 
 // Pick is the decision half of the scoring system (spec §C5).
 //
-// It returns an auth id only when the winner is clearly ahead; otherwise it
-// declines, so the host's own affinity and round-robin stay in charge. Declining
-// is always safe: CLIProxyAPI treats Handled=false as "use the built-in
-// scheduler", which is exactly the behaviour we want when the plugin has nothing
-// better to say.
+// It returns an auth id whenever one candidate is usable, breaking ties
+// deterministically from the session hash so a conversation keeps its account.
+// It declines only when it has nothing to say: no candidates, no usable
+// candidate, or no candidate that belongs to this provider. Declining is always
+// safe: CLIProxyAPI treats Handled=false as "use the built-in scheduler", which
+// is what we want when the plugin has no better answer.
 type candidate struct {
 	AuthID      string
 	Quota       Quota
 	SameSession bool
-	// VetoReason is set when the credential itself is unusable (bad key), which
-	// is not expressible through quota windows alone.
-	VetoReason string
 	// Suspect is set when the key is quarantined by a failed probe: the
 	// user-specified -20000, below every veto, unrecoverable by stickiness.
 	Suspect string
+	// Foreign marks a credential from another provider that the host offered
+	// for the same model id. We cannot read its quota, so it scores zero: a
+	// fallback for when the subscription is spent, never a competitor.
+	Foreign bool
 }
 
 // scoreEntry is one candidate's score exactly as the decision computed it, so
@@ -40,8 +46,9 @@ type decision struct {
 	Ranked []scoreEntry
 }
 
-// Pick chooses among candidates by score, declining on ties and when every
-// candidate is vetoed.
+// Pick chooses among candidates by score: our own credentials on their real
+// quota, another provider's credentials at zero, and a session's bound account
+// on top of everything. Ties are broken from the session hash.
 type scored struct {
 	authID string
 	score  int
@@ -57,14 +64,18 @@ func Pick(cands []candidate, opts scoreOptions) decision {
 	vetoed := 0
 	for _, c := range cands {
 		s, why := Score(c.Quota, c.SameSession, opts)
-		if c.Suspect != "" {
-			s, why = suspectPenalty, "suspect: "+c.Suspect
-		} else if c.VetoReason != "" {
-			s = vetoPenalty
+		if c.Foreign {
+			// We cannot read another provider's quota, so it contributes no
+			// signal: zero, plus the stickiness bonus if this session already
+			// runs on it. Any usable subscription credential scores above zero,
+			// so the subscription is used first and only a spent pool lets the
+			// request fall through to the other provider.
+			s, why = 0, ""
 			if c.SameSession {
-				s += sessionBonus
+				s = sessionBonus
 			}
-			why = c.VetoReason
+		} else if c.Suspect != "" {
+			s, why = suspectPenalty, "suspect: "+c.Suspect
 		}
 		if why != "" {
 			vetoed++
@@ -96,13 +107,53 @@ func Pick(cands []candidate, opts scoreOptions) decision {
 			second = s
 		}
 	}
-	if float64(best.score-second.score) < tieEpsilon {
-		return decision{Reason: "tie, deferring to host", Vetoed: vetoedIDs(ranked), Ranked: rankedEntries(ranked)}
-	}
 	if best.reason != "" {
 		return decision{Reason: "winner vetoed", Vetoed: vetoedIDs(ranked), Ranked: rankedEntries(ranked)}
 	}
+	if float64(best.score-second.score) < tieEpsilon {
+		// A tie is still a decision we can make deterministically. Deferring
+		// left sticky_sessions at 0 and let the host rotate one conversation
+		// across accounts, so prompt cache never hit.
+		if winner := breakTie(ranked, best.score, opts.TieSeed); winner != "" {
+			return decision{AuthID: winner, Handled: true, Reason: "tie, broken by session hash",
+				Ranked: rankedEntries(ranked)}
+		}
+		return decision{Reason: "tie, deferring to host", Vetoed: vetoedIDs(ranked), Ranked: rankedEntries(ranked)}
+	}
 	return decision{AuthID: best.authID, Handled: true, Reason: "highest score", Ranked: rankedEntries(ranked)}
+}
+
+// breakTie names the winner of a tie deterministically.
+//
+// #FUNC     Pick one of the equal-scoring candidates from the session seed.
+// #IN       the ranked scores, the tied score, and the session hash.
+// #EDGE-IN  empty seed (no session header) → the ordering falls back to the
+//
+//	candidate id alone, so the pool still uses one stable account
+//	instead of alternating.
+//
+// #OUT      the auth id this session must use, or "" when every tied candidate
+//
+//	is vetoed and the caller should keep declining.
+//
+// #WHY      hashing the session into the comparison keeps one conversation on
+//
+//	one account while different conversations still spread across the
+//	pool; a fixed "lowest id wins" would collapse every session onto
+//	one credential.
+func breakTie(ranked []scored, top int, seed string) string {
+	winner, bestSum := "", ""
+	for _, s := range ranked {
+		if s.score != top || s.reason != "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(seed + "\x00" + s.authID))
+		printable := hex.EncodeToString(sum[:])
+		if winner == "" || printable < bestSum {
+			winner, bestSum = s.authID, printable
+		}
+	}
+	return winner
 }
 
 // rankedEntries converts the working scores into the decision's audit form.

@@ -30,8 +30,8 @@ const (
 	// chat timeout because this call blocks the host's model registration.
 	modelProbeTimeout = 15 * time.Second
 	// modelCatalogueLimit caps how much of the response is read. It is NOT
-	// errorLimit: a real catalogue is ~20 KB for 14 models, and the 16 KiB
-	// error-text cap truncated the JSON in the first live run.
+	// errorLimit: a real catalogue is tens of KB, and the 16 KiB error-text cap
+	// truncated the JSON in the first live run.
 	modelCatalogueLimit = 4 << 20
 	// modelIDLimit drops absurd ids before they reach the host registry.
 	modelIDLimit = 200
@@ -44,22 +44,22 @@ const (
 	catalogueSourceBootstrap = "bootstrap"
 )
 
-// bootstrapModels is the Go catalogue as advertised on 2026-11-18: a cold-start
-// fallback only, announced in the log whenever it is used.
+// bootstrapModels is the cold-start fallback when the catalogue cannot be
+// fetched and nothing was ever cached: the one model this plugin exists to
+// serve, plus the two free-tier ids that cost nothing to route.
+//
+// #FUNC   Name the models served before any fetch has succeeded.
+// #NOT    Not a catalogue: it is a floor, not a record. A snapshot copied here
+//
+//	rots — six of fourteen names were already gone when this was trimmed.
+//
+// #WHY    the fallback must stay minimal: a stale id here answers /v1/models
+//
+//	with a model that fails at request time, which is exactly the
+//	baked-list failure this plugin exists to avoid.
 var bootstrapModels = []string{
 	"gemini-4-argon",
-	"deepseek-v4.1-flash",
-	"glm-5.3",
-	"glm-5.3-flash",
-	"qwen3.8-max",
-	"qwen4-max",
-	"kimi-k3",
-	"kimi-k3.1-pro",
-	"grok-4.7",
-	"minimax-m3.1-flash",
-	"muse-spark-1.3-contributor",
 	"beam-free",
-	"hy4",
 	"hy4-flash-free",
 }
 
@@ -94,7 +94,7 @@ var (
 		inflight *catalogueFetch
 	}
 	// perKeyCatalogue caches one account's list for model.for_auth: the model set
-	// is per subscription (two keys on different plans returned 14 and 29 ids).
+	// is per subscription, so two keys can legitimately disagree.
 	perKeyCatalogue = map[string]catalogue{}
 )
 
@@ -165,6 +165,16 @@ func currentCatalogue() catalogue {
 }
 
 // fetchSharedCatalogue performs the provider-wide fetch outside every lock.
+// #FUNC      Fetch the provider-wide catalogue off every pick path.
+// #IN        the live config and the last good catalogue.
+// #EDGE-IN   every pooled key unusable → the previous list still serves, with a
+//
+//	warning → TestCatalogueKeepsLastGoodOnFailure
+//
+// #OUT       the fetched catalogue, or the previous/bootstrap one.
+// #WHY       `modelCatalogueTTL` also caches failures, so a dead gateway is not
+//
+//	retried on every call.
 func fetchSharedCatalogue(cfg pluginConfig, prev catalogue) catalogue {
 	keys, errPool := modelKeyPoolFn()
 	var lastErr error = errPool
@@ -316,6 +326,12 @@ func isControlRune(r rune) bool { return unicode.IsControl(r) }
 // modelKeyPool returns keys to try for the catalogue call: enabled, non
 // quarantined auths of this provider, plus the host error when the list is
 // unavailable so the log can tell an empty pool from a broken callback.
+// #FUNC      Collect the keys a catalogue fetch may use.
+// #EDGE-IN   a quarantined key → excluded: a dead key must not stand between
+//
+//	the pool and its model list → TestKeysFromAuthFilesSkipsUnusable
+//
+// #WHY       the pool is host state, re-read here because keys come and go.
 func modelKeyPool() ([]string, error) {
 	var list authFileList
 	if err := callHost(pluginabi.MethodHostAuthList, struct{}{}, &list); err != nil {
@@ -327,6 +343,11 @@ func modelKeyPool() ([]string, error) {
 // keysFromAuthFiles filters host auth rows down to keys a catalogue call may use,
 // skipping anything that cannot pay: wrong provider, disabled, a key the host
 // cannot resolve, a key already proven dead, or a duplicate.
+// #FUNC      Filter host auth rows down to usable catalogue keys.
+// #EDGE-IN   wrong provider, disabled, unresolvable or duplicate key → skipped.
+// #WHY       a duplicate `api_key` shares one quota cache entry, so fetching with
+//
+//	it twice would double upstream calls for the same account.
 func keysFromAuthFiles(files []authFileEntry, baseURL string, keyFor func(string) (string, bool)) []string {
 	keys := make([]string, 0, len(files))
 	seen := make(map[string]struct{}, len(files))

@@ -73,7 +73,7 @@ your client ──HTTP──▶ CLIProxyAPI + go-adapter ──HTTPS──▶ op
        go-adapter:
          enabled: true
          base-url: "https://opencode.ai/inference/go/openai/v1"
-         user-agent: "go-adapter/0.9.4"
+         # user-agent is optional; it defaults to identifying this plugin
    ```
 
 3. Start CLIProxyAPI and add your key: use the panel's auth-file dialog (it
@@ -118,17 +118,12 @@ Everything lives under `plugins.configs.go-adapter` in `config.yaml`:
 Decoding is strict: an unknown key (e.g. `baseUrl:`) is a config error in the log
 rather than a silent fallback to the default upstream.
 
-The model catalogue comes from the gateway, with a small baked-in bootstrap list
-as the last resort. `GET {base-url}/models` is called per account
-(`model.for_auth`) and provider-wide (`model.static`), cached for 2 minutes; a
-failed refresh serves the last good list, and only a cold start with no reachable
-gateway falls back to the bootstrap list — logged as a warning. The status API
-reports which one you are looking at.
-
-When a model appears upstream, the proxy publishes it at the host's next model
-registration: a restart, a config save, or an auth add/refresh (the plugin
-re-validates keys every 15 minutes). Until then `/v1/models` keeps the previous
-list — the plugin's own view is already current.
+The model catalogue always comes from the gateway — never a table baked into the
+binary. It is cached briefly, per account and provider-wide; a failed refresh
+serves the last good list, and the status page says which source you are looking
+at. When a model appears upstream, the proxy publishes it at the host's next
+model registration (restart, config save, or auth change) — the plugin's own
+view is already current by then.
 
 ## Build from source
 

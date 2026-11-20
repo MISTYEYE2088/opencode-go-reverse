@@ -101,3 +101,18 @@ func TestUnreachableGatewayIsUnknown(t *testing.T) {
 		t.Fatalf("want unknown when unreachable, got %q", status)
 	}
 }
+
+// A 200 carrying something that is not a three-window usage document is "no
+// answer", never a validation: a WAF page must not clear a quarantine, and it
+// must not quarantine a good key either.
+func TestMalformed200IsNotAUsageDocument(t *testing.T) {
+	srv := usageServer(t, 200, `{"error":{"message":"challenge"}}`)
+	t.Cleanup(srv.Close)
+	status, reason, quota := probeKeyWithQuota(http.DefaultClient, "k", srv.URL)
+	if status != statusUnknown {
+		t.Fatalf("a non-usage 200 must be unknown, got %q (%q)", status, reason)
+	}
+	if quota.Known() {
+		t.Fatal("a non-usage 200 must not yield quota data")
+	}
+}

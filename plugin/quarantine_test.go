@@ -50,16 +50,48 @@ func TestSuspectScoresMinusTwentyThousand(t *testing.T) {
 	}
 	// Exclusions ride along on DECLINES (the host still has to pick someone);
 	// on a handled decision the winner is already ours, so Vetoed is empty by design.
+	// The quarantined account must never win, even when the healthy ones tie.
 	tie := Pick([]candidate{
 		{AuthID: "a", Quota: acct(40, 40, 20*24*time.Hour)},
 		{AuthID: "b", Quota: acct(40, 40, 20*24*time.Hour)},
 		{AuthID: "suspect", Suspect: "usage-502"},
 	}, defaultScoreOptions(now))
-	if tie.Handled {
-		t.Fatal("two identical healthy candidates must decline")
+	if !tie.Handled || tie.AuthID == "suspect" {
+		t.Fatalf("a quarantined key must lose to any healthy one, got %+v", tie)
 	}
-	if len(tie.Vetoed) != 1 || tie.Vetoed[0] != "suspect" {
-		t.Fatalf("decline must exclude the suspect id, got %v", tie.Vetoed)
+}
+
+// A pool made only of quarantined keys must say so, rather than declining into a
+// selector that would route the request onto one of them.
+func TestAllQuarantinedRejectsWithGuidance(t *testing.T) {
+	cands := []candidate{
+		{AuthID: "a", Suspect: "invalid: unauthorized"},
+		{AuthID: "b", Suspect: "invalid: unauthorized"},
+	}
+	d := Pick(cands, defaultScoreOptions(now))
+	resp := pickResponseFor(d, cands)
+	if !resp.Handled || !resp.Reject {
+		t.Fatalf("an all-quarantined pool must reject, got %+v", resp)
+	}
+	if resp.RejectCode != "auth_unavailable" || !strings.Contains(resp.RejectReason, "auth list") {
+		t.Fatalf("rejection must name the code and the way out, got %+v", resp)
+	}
+}
+
+// With another provider in the pool the request is still served: its credential
+// wins at zero once every key of ours is quarantined.
+func TestQuarantinedPoolFallsThroughToOtherProvider(t *testing.T) {
+	cands := []candidate{
+		{AuthID: "ours", Suspect: "invalid: unauthorized"},
+		{AuthID: "deepseek-1", Foreign: true},
+	}
+	d := Pick(cands, defaultScoreOptions(now))
+	if !d.Handled || d.AuthID != "deepseek-1" {
+		t.Fatalf("a spent pool must fall through to the other provider, got %+v", d)
+	}
+	resp := pickResponseFor(d, cands)
+	if !resp.Handled || resp.Reject {
+		t.Fatalf("the fallback must be handled, not rejected, got %+v", resp)
 	}
 }
 

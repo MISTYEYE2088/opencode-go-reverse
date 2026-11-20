@@ -59,6 +59,7 @@ type schedPickResponse struct {
 	Handled           bool     `json:"Handled"`
 	Reject            bool     `json:"Reject,omitempty"`
 	RejectReason      string   `json:"RejectReason,omitempty"`
+	RejectCode        string   `json:"RejectCode,omitempty"`
 	ExcludeCandidates []string `json:"ExcludeCandidates,omitempty"`
 }
 
@@ -90,6 +91,15 @@ func boundAuth(hash string) string {
 // bindSession records a binding and keeps the map bounded: expired entries are
 // swept on every insert, and a full map still admits new sessions by evicting
 // a slice of arbitrary old ones.
+// #FUNC      Record one session→account binding.
+// #EDGE-IN   map at `stickyCap` (10 000) → expired entries swept first, then an
+//
+//	arbitrary tenth evicted, so a map-flood client cannot wedge the
+//	host → TestStickyMapCappedAndSwept
+//
+// #WHY       `sticky` keys are hashes, never raw session ids: a client-controlled
+//
+//	header stored verbatim is a memory-growth and log-forgery channel.
 func bindSession(hash, authID string) {
 	if hash == "" || authID == "" {
 		return
@@ -128,7 +138,7 @@ func bindSession(hash, authID string) {
 //
 // #EDGE-OUT A key the gateway rejects vetoes its candidate, and the veto rides
 //
-//	along even when the plugin declines → TestDeclineExcludesVetoedCandidates
+//	along even when the plugin declines → TestExclusionsDropWhenEveryCandidateIsOut
 //
 // #WHY      `Handled=false` without `ExcludeCandidates` hands a just-proven-dead
 //
@@ -146,25 +156,102 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	hash := sessionHash(sessionKeyFromHeaders(req.Options.Headers))
 	bound := boundAuth(hash)
 
+	// Rule 1: a model outside the OpenCode Go catalogue is not ours at all. The
+	// host lists a provider for a model only once that provider registered it,
+	// so this gate is the model-name check — and it runs before any scoring, so
+	// another provider's traffic is never graded with quota data we do not have.
+	if !coversGoModels(req) {
+		logPick(hash, decision{Reason: "model outside the OpenCode Go catalogue, deferring to host"})
+		return json.Marshal(schedPickResponse{Handled: false})
+	}
+
 	cands := buildCandidates(req.Candidates, bound, keyForAuthID)
 
 	opts := defaultScoreOptions(time.Now())
 	// The upstream free tier ("-free" suffix) draws no paid quota: window
 	// vetoes are account-quota protection and must not block it.
 	opts.FreeModel = strings.HasSuffix(strings.ToLower(strings.TrimSpace(req.Model)), "-free")
+	// Equal scores are decided from the session hash, so one conversation keeps
+	// one account instead of rotating between equal-scoring keys.
+	opts.TieSeed = hash
 
 	decision := Pick(cands, opts)
 	logPick(hash, decision)
-	if !decision.Handled {
-		// Exclusions are a hint, not a veto over the host's whole pool: when
-		// every candidate is out, excluding all of them would turn a bad minute
-		// into "no auth available" for every request, so decline cleanly and
-		// let the host try.
-		return json.Marshal(schedPickResponse{Handled: false,
-			ExcludeCandidates: pickExclusions(decision, len(cands))})
+	if decision.Handled {
+		bindSession(hash, decision.AuthID)
 	}
-	bindSession(hash, decision.AuthID)
-	return json.Marshal(schedPickResponse{AuthID: decision.AuthID, Handled: true})
+	return json.Marshal(pickResponseFor(decision, cands))
+}
+
+// coversGoModels reports whether the host resolved this request to our provider.
+//
+// #FUNC     Decide whether a pick request is ours to make at all.
+// #IN       the pick request's primary provider and its accepted provider list.
+// #OUT      true when "go-adapter" is among them.
+// #WHY      the host keeps one scheduler plugin for the whole proxy, so without
+//
+//	this gate the plugin would grade requests for keys it cannot read.
+func coversGoModels(req schedPickRequest) bool {
+	if strings.EqualFold(strings.TrimSpace(req.Provider), providerKey) {
+		return true
+	}
+	for _, provider := range req.Providers {
+		if strings.EqualFold(strings.TrimSpace(provider), providerKey) {
+			return true
+		}
+	}
+	return false
+}
+
+// pickResponseFor maps a decision onto the reply the host understands.
+//
+// #FUNC     Turn a pick decision into a scheduler response.
+// #IN       the decision and the scored candidates behind it.
+// #EDGE-IN  every candidate is a quarantined key of ours → reject with our own
+//
+//	code and guidance, because a decline would send the request straight
+//	back onto a proven-dead key.
+//
+// #OUT      a handled pick, a rejection, or a decline with exclusions.
+// #EDGE-OUT another provider's credential is in the pool → it wins at zero once
+//
+//	our pool is spent, so the request is served rather than failed.
+//
+// #WHY      a silent decline is only safe when a healthy credential remains
+//
+//	somewhere in the host's pool.
+func pickResponseFor(d decision, cands []candidate) schedPickResponse {
+	if d.Handled {
+		return schedPickResponse{AuthID: d.AuthID, Handled: true}
+	}
+	if allSuspect(cands) {
+		return schedPickResponse{
+			Handled:    true,
+			Reject:     true,
+			RejectCode: "auth_unavailable",
+			RejectReason: "every go-adapter key is quarantined after a definitive auth rejection; " +
+				"revive one with its quota button in the host's auth list, or Refresh all keys on the Go Adapter page",
+		}
+	}
+	// Exclusions are a hint, not a veto over the host's whole pool: excluding
+	// every candidate would turn a bad minute into "no auth available" for all
+	// requests, so decline cleanly and let the host try.
+	return schedPickResponse{Handled: false, ExcludeCandidates: pickExclusions(d, len(cands))}
+}
+
+// allSuspect reports whether the pool consists only of quarantined keys. A
+// foreign credential is never suspect, so a mixed pool never reaches the reject
+// path: it falls through to the other provider instead.
+func allSuspect(cands []candidate) bool {
+	if len(cands) == 0 {
+		return false
+	}
+	for _, c := range cands {
+		if c.Suspect == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // pickExclusions decides what to tell the host to avoid.
@@ -185,9 +272,39 @@ func pickExclusions(d decision, total int) []string {
 
 // buildCandidates turns host candidates into scored candidates. resolve is
 // injectable so the stickiness rule can be tested without host callbacks.
+//
+// #FUNC     Score the host's candidate list from this plugin's point of view.
+// #IN       the host's candidates, the session's bound auth id, and a resolver
+//
+//	from auth id to our key.
+//
+// #EDGE-IN  a candidate names a provider that is not ours → it is marked foreign
+//
+//	and keeps no quota signal at all, so it can only win at zero when
+//	our own pool is spent.
+//
+// #OUT      one candidate per host candidate, ours scored, the rest marked.
+// #EDGE-OUT a foreign candidate the session is bound to still earns the
+//
+//	stickiness bonus (its 1000 is the reason a conversation stays on it).
+//
+// #WHY      the host offers one scheduler every provider's credentials, and
+//
+//	scoring a key whose quota cannot be read would invent a comparison.
 func buildCandidates(scheds []schedCandidate, bound string, resolve func(string) (string, bool)) []candidate {
 	cands := make([]candidate, 0, len(scheds))
 	for _, c := range scheds {
+		// A named provider settles ownership without asking the host; only a
+		// blank provider needs the resolver.
+		named := strings.TrimSpace(c.Provider)
+		if named != "" && !strings.EqualFold(named, providerKey) {
+			cands = append(cands, candidate{
+				AuthID:      c.ID,
+				Foreign:     true,
+				SameSession: bound != "" && bound == c.ID,
+			})
+			continue
+		}
 		key, keyOK := resolve(c.ID)
 		q := Quota{}
 		var cand candidate
@@ -207,6 +324,14 @@ func buildCandidates(scheds []schedCandidate, bound string, resolve func(string)
 					cand.Suspect = "invalid: " + bad.reason
 				}
 			}
+		}
+		if !keyOK {
+			// Ours by name, but the host could not hand us the key: it stays a
+			// candidate at the neutral score, without the stickiness bonus,
+			// because an unresolvable bound account is exactly the dead one we
+			// must not reward.
+			cands = append(cands, candidate{AuthID: c.ID})
+			continue
 		}
 		cand.AuthID = c.ID
 		cand.Quota = q

@@ -284,6 +284,12 @@ var (
 
 // upstreamTransport clones the default transport once. It must be a Clone: the
 // default carries the proxy environment this network needs for egress.
+// #FUNC      Build the shared upstream HTTP transport.
+// #NOT       Not a fresh client per call.
+// #WHY       `DefaultTransport.Clone` keeps proxy and TLS defaults while owning
+//
+//	this pool's connection limits: a fresh transport per request cost
+//	one TCP+TLS handshake per call on the same host.
 func upstreamTransport() *http.Transport {
 	transportOnce.Do(func() {
 		t := http.DefaultTransport.(*http.Transport).Clone()
@@ -297,6 +303,11 @@ func upstreamTransport() *http.Transport {
 // transportError turns a dial/TLS/reset failure into the error code the host
 // treats as transient, so a network blip does not cool the model for 60 s the way
 // an untyped executor_error would.
+// #FUNC      Classify a transport-level failure.
+// #OUT       `transient_transport`: a dead connection is nobody's fault.
+// #WHY       labelling a transport failure `request_scoped` makes the host blame
+//
+//	the caller; `credential_invalid` would drop a good key.
 func transportError(err error) *envelopeError {
 	return &envelopeError{
 		Code:    "transient_transport",
@@ -310,6 +321,10 @@ func requestError(status int, message string) *envelopeError {
 }
 
 // retryAfterOf reads the upstream Retry-After hint, if any.
+// #FUNC      Read the upstream retry hint from `Retry-After`.
+// #WHY       the hint is honoured verbatim so the host's cooldown uses the
+//
+//	gateway's own number, not a guess.
 func retryAfterOf(h http.Header) time.Duration {
 	if h == nil {
 		return 0
@@ -324,6 +339,23 @@ func retryAfterOf(h http.Header) time.Duration {
 // cooldown classifier and the client both understand: the status survives, the
 // retry hint survives, credential-wide failures are marked as such, and the
 // embedded body is truncated and scrubbed.
+// #FUNC      Map one upstream failure onto the host's error taxonomy.
+// #EDGE-IN   `401`/`403` → `credential_invalid`: the host drops the key
+//
+//	→ TestUpstreamErrorScrubbedAndStructured
+//
+// #EDGE-IN   `429` → `credential_quota` with `retry_after` preserved
+//
+//	→ TestStreamUpstreamErrorCarriesRetryAfter
+//
+// #EDGE-IN   body containing "isn't included in OpenCode Go" → `model_not_found`:
+//
+//	the plan gate is neither a credential nor a transport problem
+//
+// #EDGE-IN   `5xx` → `transient_transport`: retryable, no credential blame
+// #WHY       the RPC envelope has no status field, so this classification IS the
+//
+//	error's identity downstream.
 func upstreamError(status int, body []byte, retryAfter time.Duration) *envelopeError {
 	code, scoped := "upstream_error", false
 	switch {
@@ -499,6 +531,15 @@ var errEmitClosed = errors.New("stream emit refused by host")
 // relayFrames reads SSE events (LF or CRLF framed) and emits each one raw.
 // A single newline-free line is flushed every lineBuf bytes, so no line —
 // however hostile — can be buffered whole.
+// #FUNC      Relay one SSE stream frame-by-frame through the host.
+// #NOT       No re-chunking: frames are emitted as they arrive.
+// #EDGE-OUT  a partial line at stream end is flushed, not dropped →
+//
+//	TestRelayHugeLineFlushesMidLine
+//
+// #WHY       buffering the whole body would hold the host request open with no
+//
+//	output for the whole upstream duration.
 func relayFrames(streamID string, body io.Reader, emit func([]byte) error) error {
 	reader := bufio.NewReaderSize(io.LimitReader(body, responseCap+1), lineBufSize)
 	var total int64
@@ -552,6 +593,14 @@ func relayFrames(streamID string, body io.Reader, emit func([]byte) error) error
 // splitSSE cuts a buffered SSE body into whole events for the fallback path.
 // It splits on a blank line in either LF or CRLF form and keeps each event's
 // original bytes, delimiter included.
+// #FUNC      Split a stream buffer into complete SSE lines.
+// #EDGE-OUT  an incomplete trailing line → kept as the remainder for the next
+//
+//	read, never emitted half → TestRelayHugeLineFlushesMidLine
+//
+// #WHY       emitting a partial JSON frame hands the client a parse error that
+//
+//	looks like an upstream failure.
 func splitSSE(body []byte) [][]byte {
 	locs := sseBlank.FindAllIndex(body, -1)
 	frames := make([][]byte, 0, len(locs)+1)

@@ -60,6 +60,33 @@ var fetchUsageFn = fetchUsage
 // rather than as a reason to suspect the key.
 var errQuotaUnknown = errors.New("quota unknown")
 
+// seedQuota records windows that were read for another purpose, so the first
+// scheduler pick already has a real score instead of the neutral one.
+//
+// #FUNC     Store a quota snapshot that some earlier call already fetched.
+// #EDGE-IN  a probe that failed carried no windows (Quota{}.Known() is false) →
+//
+//	nothing is stored, so a network blip never looks like a real reading.
+//
+// #WHY      the key validation at add/refresh time hits the same usage route; the
+//
+//	numbers were being thrown away and the first pick scored 450.
+func seedQuota(apiKey, base string, quota Quota) {
+	if strings.TrimSpace(apiKey) == "" || !quota.Known() {
+		return
+	}
+	quotaMu.Lock()
+	defer quotaMu.Unlock()
+	cacheKey := quotaCacheKey(apiKey, base)
+	if reason, bad := quarantined(cacheKey); bad {
+		// A quarantined key stays quarantined: a snapshot must not paper over a
+		// definitive rejection.
+		_ = reason
+		return
+	}
+	quotaCache[cacheKey] = quotaEntry{quota: quota, at: time.Now()}
+}
+
 // fetchUsage reads the windows for one key and normalises them into Quota.
 func fetchUsage(apiKey, base string) (Quota, error) {
 	return fetchUsageWith(&http.Client{Timeout: usageTimeout}, apiKey, base)
@@ -270,6 +297,10 @@ func sweepQuotaCacheLocked() {
 }
 
 // quotaCacheKey derives the cache id from the credential, never the auth id.
+// #FUNC      The cache key for one credential's quota: sha256(api_key + base).
+// #WHY       keyed by the key string so two records sharing one `api_key` share
+//
+//	one snapshot — the account is the same upstream entity.
 func quotaCacheKey(apiKey, baseURL string) string {
 	sum := sha256.Sum256([]byte(apiKey + "\x00" + baseURL))
 	return hex.EncodeToString(sum[:8])
